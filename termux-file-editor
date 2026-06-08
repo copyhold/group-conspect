@@ -1,0 +1,17 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Invoked by Termux when a file is shared/opened with Termux as editor.
+# $1 = path to the shared file (or content:// URI)
+
+source ~/.bashrc 2>/dev/null || true
+
+echo "==============================="
+echo " Audio Transcription Pipeline"
+echo "==============================="
+echo "Input: $1"
+echo ""
+
+python "$HOME/process_audio.py" "$1"
+
+echo ""
+echo "Press Enter to close..."
+read -r
