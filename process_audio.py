@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Transcribe and summarize audio recordings via Google Gemini REST API."""
 
+import itertools
 import os
 import sys
 import subprocess
@@ -16,7 +17,14 @@ import requests
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 MODEL = "gemini-2.5-flash"
-DOWNLOADS_DIR = Path("/storage/emulated/0/Download")
+# Rough tokens-per-second of audio for estimating transcript progress.
+# ~150 wpm speech × (4/3 tokens/word) / 60 ≈ 2.5 t/s; silence/slow speech pulls it lower.
+_TOKENS_PER_AUDIO_SEC = 2.0
+_android_downloads = Path("/storage/emulated/0/Download")
+DOWNLOADS_DIR = Path(os.environ.get(
+    "DOWNLOADS_DIR",
+    str(_android_downloads) if _android_downloads.parent.exists() else str(Path.home() / "Downloads"),
+))
 TEMP_DIR = Path(os.environ.get("TMPDIR", "/data/data/com.termux/files/home/tmp"))
 
 
@@ -50,7 +58,7 @@ def convert_to_mp3(input_path: Path) -> Path:
 
     print(f"Converting {input_path.name} -> MP3...")
     result = subprocess.run(
-        ["ffmpeg", "-i", str(input_path), "-y", str(mp3_path)],
+            ["ffmpeg", "-i", str(input_path), "-to","00:20:00","-y", str(mp3_path)],
         capture_output=True,
         text=True,
     )
@@ -69,11 +77,21 @@ def _api(path: str, method: str = "GET", **kwargs):
     return resp
 
 
-def _api_stream(path: str, **kwargs) -> str:
-    """POST to a Gemini streaming endpoint; return concatenated text."""
+def _api_stream(path: str, label: str = "Generating", total_estimate: int | None = None, **kwargs) -> str:
+    """POST to a Gemini streaming endpoint; return concatenated text.
+
+    Prints a live \r progress line: spinner, label, token count, optional %, elapsed.
+    total_estimate — expected total output tokens (initial hint; overridden by promptTokenCount
+    from the first API chunk, which lets us self-calibrate without needing audio duration).
+    Gemini encodes audio at ~32 tokens/sec; output transcript runs at ~_TOKENS_PER_AUDIO_SEC.
+    """
     sep = "&" if "?" in path else "?"
     url = f"{GEMINI_BASE}/{path}{sep}key={GEMINI_API_KEY}"
-    # stream=True keeps the socket alive; each SSE line arrives as it's generated
+    spinner = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    t0 = time.time()
+    tokens = 0
+    _AUDIO_TOKENS_PER_SEC = 32  # Gemini's audio encoding rate
+
     with requests.post(url, timeout=(30, 300), stream=True, **kwargs) as resp:
         resp.raise_for_status()
         parts = []
@@ -94,7 +112,34 @@ def _api_stream(path: str, **kwargs) -> str:
                 parts.append(chunk["candidates"][0]["content"]["parts"][0]["text"])
             except (KeyError, IndexError):
                 pass
+            usage = chunk.get("usageMetadata", {})
+            tokens = usage.get("candidatesTokenCount", tokens)
+            if total_estimate is None:
+                prompt_tokens = usage.get("promptTokenCount")
+                if prompt_tokens:
+                    audio_secs = prompt_tokens / _AUDIO_TOKENS_PER_SEC
+                    total_estimate = max(1, int(audio_secs * _TOKENS_PER_AUDIO_SEC))
+
+            elapsed = time.time() - t0
+            pct = f" | ~{min(99, round(tokens / total_estimate * 100)):2d}%" if total_estimate else ""
+            print(f"\r  {next(spinner)} {label}... {tokens:,} tokens{pct} | {elapsed:.0f}s", end="", flush=True)
+
+        elapsed = time.time() - t0
+        print(f"\r  ✓ {label} done — {tokens:,} tokens | {elapsed:.0f}s          ")
         return "".join(parts)
+
+
+def get_audio_duration(path: Path) -> float | None:
+    """Return audio duration in seconds via ffprobe, or None on failure."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(result.stdout.strip()) if result.returncode == 0 else None
+    except Exception:
+        return None
 
 
 def upload_file(mp3_path: Path) -> tuple[str, str]:
@@ -157,7 +202,7 @@ def delete_file(file_name: str) -> None:
         pass
 
 
-def generate(prompt: str, file_uri: str) -> str:
+def generate(prompt: str, file_uri: str, label: str = "Generating", duration_secs: float | None = None) -> str:
     """Call Gemini streamGenerateContent with a text prompt + audio file."""
     payload = {
         "contents": [{
@@ -165,9 +210,11 @@ def generate(prompt: str, file_uri: str) -> str:
                 {"text": prompt},
                 {"file_data": {"mime_type": "audio/mpeg", "file_uri": file_uri}},
             ]
-        }]
+        }],
+        "generationConfig": {"temperature": 0},
     }
-    return _api_stream(f"models/{MODEL}:streamGenerateContent?alt=sse", json=payload)
+    estimate = int(duration_secs * _TOKENS_PER_AUDIO_SEC) if duration_secs else None
+    return _api_stream(f"models/{MODEL}:streamGenerateContent?alt=sse", label=label, total_estimate=estimate, json=payload)
 
 
 def save_outputs(stem: str, transcript: str, summary: str) -> tuple[Path, Path]:
@@ -200,20 +247,28 @@ def main():
     stem = input_path.stem
 
     mp3_path = convert_to_mp3(input_path)
+    duration = get_audio_duration(mp3_path)
+    if duration:
+        mins, secs = divmod(int(duration), 60)
+        print(f"Audio duration: {mins}m {secs:02d}s")
+
     file_uri, file_name = upload_file(mp3_path)
 
     try:
         wait_for_file(file_name)
 
-        print("Transcribing...")
         transcript = generate(
             "Transcribe this audio recording accurately. "
+            "The audio is in Russian. "
             "If there are multiple speakers, label them as 'Speaker 1:', 'Speaker 2:', etc. "
+            "If a word or phrase is unclear, write [неразборчиво] and continue. "
+            "Never repeat the same phrase more than twice in a row. "
             "Return only the transcription text, no commentary.",
             file_uri,
+            label="Transcribing",
+            duration_secs=duration,
         )
 
-        print("Summarizing...")
         summary = generate(
             "Summarize the following transcript concisely. "
             "Use Markdown formatting with headings and bullet lists. "
@@ -221,6 +276,7 @@ def main():
             "Write the summary in Russian.\n\n"
             f"Transcript:\n{transcript}",
             file_uri,
+            label="Summarizing",
         )
     finally:
         delete_file(file_name)
