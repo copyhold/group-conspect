@@ -16,7 +16,8 @@ import requests
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.5-flash"
+CHUNK_MINUTES = 10  # split audio into segments this long before transcribing
 # Rough tokens-per-second of audio for estimating transcript progress.
 # ~150 wpm speech × (4/3 tokens/word) / 60 ≈ 2.5 t/s; silence/slow speech pulls it lower.
 _TOKENS_PER_AUDIO_SEC = 2.0
@@ -48,6 +49,19 @@ def resolve_input(arg: str) -> Path:
     return temp_file
 
 
+_TRANSCRIPTION_PROMPT = (
+    "ЗАДАЧА: Сделай дословную транскрипцию этой аудиозаписи.\n\n"
+    "СТРОГИЕ ПРАВИЛА:\n"
+    "- Выводи ТОЛЬКО слова, произнесённые на записи — слово за словом, как они звучат.\n"
+    "- НЕ переводи, НЕ резюмируй, НЕ перефразируй, НЕ добавляй комментарии.\n"
+    "- Язык записи — русский. Пиши по-русски.\n"
+    "- Если говорит несколько человек — помечай смену говорящего: «Участник 1:», «Участник 2:» и т.д.\n"
+    "- Неразборчивые слова или фразы обозначай как [неразборчиво].\n"
+    "- Продолжай транскрипцию до самого конца записи.\n\n"
+    "Начни сразу с первых слов записи."
+)
+
+
 def convert_to_mp3(input_path: Path) -> Path:
     """Convert audio to MP3; return original path if already MP3."""
     if input_path.suffix.lower() == ".mp3":
@@ -58,7 +72,7 @@ def convert_to_mp3(input_path: Path) -> Path:
 
     print(f"Converting {input_path.name} -> MP3...")
     result = subprocess.run(
-            ["ffmpeg", "-i", str(input_path), "-to","00:20:00","-y", str(mp3_path)],
+            ["ffmpeg", "-i", str(input_path), "-y", str(mp3_path)],
         capture_output=True,
         text=True,
     )
@@ -66,6 +80,21 @@ def convert_to_mp3(input_path: Path) -> Path:
         raise RuntimeError(f"ffmpeg error:\n{result.stderr}")
 
     return mp3_path
+
+
+def split_audio(mp3_path: Path, chunk_mins: int = CHUNK_MINUTES) -> list[Path]:
+    """Split MP3 into equal-length chunks; return sorted list of chunk paths."""
+    chunk_dir = TEMP_DIR / f"chunks_{mp3_path.stem}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    pattern = str(chunk_dir / "chunk_%03d.mp3")
+    result = subprocess.run(
+        ["ffmpeg", "-i", str(mp3_path), "-f", "segment",
+         "-segment_time", str(chunk_mins * 60), "-c", "copy", "-y", pattern],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg split error:\n{result.stderr}")
+    return sorted(chunk_dir.glob("chunk_*.mp3"))
 
 
 def _api(path: str, method: str = "GET", **kwargs):
@@ -92,7 +121,7 @@ def _api_stream(path: str, label: str = "Generating", total_estimate: int | None
     tokens = 0
     _AUDIO_TOKENS_PER_SEC = 32  # Gemini's audio encoding rate
 
-    with requests.post(url, timeout=(30, 300), stream=True, **kwargs) as resp:
+    with requests.post(url, timeout=(30, None), stream=True, **kwargs) as resp:
         resp.raise_for_status()
         parts = []
         for raw in resp.iter_lines():
@@ -202,16 +231,21 @@ def delete_file(file_name: str) -> None:
         pass
 
 
-def generate(prompt: str, file_uri: str, label: str = "Generating", duration_secs: float | None = None) -> str:
-    """Call Gemini streamGenerateContent with a text prompt + audio file."""
+def generate(prompt: str, file_uri: str | None = None, label: str = "Generating", duration_secs: float | None = None, max_output_tokens: int | None = None) -> str:
+    """Call Gemini streamGenerateContent with a text prompt and optional audio file."""
+    parts: list = []
+    parts.append({"text": prompt})
+    if file_uri:
+        parts.append({"file_data": {"mime_type": "audio/mpeg", "file_uri": file_uri}})
+    gen_config: dict = {
+        "temperature": 0,
+        "thinkingConfig": {"thinkingBudget": 0},
+    }
+    if max_output_tokens:
+        gen_config["maxOutputTokens"] = max_output_tokens
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"file_data": {"mime_type": "audio/mpeg", "file_uri": file_uri}},
-            ]
-        }],
-        "generationConfig": {"temperature": 0},
+        "contents": [{"parts": parts}],
+        "generationConfig": gen_config,
     }
     estimate = int(duration_secs * _TOKENS_PER_AUDIO_SEC) if duration_secs else None
     return _api_stream(f"models/{MODEL}:streamGenerateContent?alt=sse", label=label, total_estimate=estimate, json=payload)
@@ -225,10 +259,7 @@ def save_outputs(stem: str, transcript: str, summary: str) -> tuple[Path, Path]:
     s_path = DOWNLOADS_DIR / f"{stem}_{ts}_summary.txt"
 
     t_path.write_text(transcript, encoding="utf-8")
-    s_path.write_text(
-        f"SUMMARY\n{'=' * 60}\n{summary}\n\n{'=' * 60}\nFULL TRANSCRIPT\n{'=' * 60}\n{transcript}",
-        encoding="utf-8",
-    )
+    s_path.write_text(summary, encoding="utf-8")
     return t_path, s_path
 
 
@@ -252,34 +283,74 @@ def main():
         mins, secs = divmod(int(duration), 60)
         print(f"Audio duration: {mins}m {secs:02d}s")
 
-    file_uri, file_name = upload_file(mp3_path)
+    # Split into chunks to avoid repetition loops on long audio.
+    chunks = split_audio(mp3_path)
+    print(f"Split into {len(chunks)} chunk(s) of ~{CHUNK_MINUTES}m")
 
+    transcript_parts: list[str] = []
     try:
-        wait_for_file(file_name)
+        for i, chunk_path in enumerate(chunks, 1):
+            chunk_dur = get_audio_duration(chunk_path)
+            chunk_uri, chunk_name = upload_file(chunk_path)
+            try:
+                wait_for_file(chunk_name)
+                # Cap output to 4× expected tokens to stop repetition loops.
+                chunk_cap = int((chunk_dur or CHUNK_MINUTES * 60) * _TOKENS_PER_AUDIO_SEC * 4)
+                part = generate(
+                    _TRANSCRIPTION_PROMPT,
+                    chunk_uri,
+                    label=f"Transcribing {i}/{len(chunks)}",
+                    duration_secs=chunk_dur,
+                    max_output_tokens=chunk_cap,
+                )
+                transcript_parts.append(part)
+            finally:
+                delete_file(chunk_name)
 
-        transcript = generate(
-            "Transcribe this audio recording accurately. "
-            "The audio is in Russian. "
-            "If there are multiple speakers, label them as 'Speaker 1:', 'Speaker 2:', etc. "
-            "If a word or phrase is unclear, write [неразборчиво] and continue. "
-            "Never repeat the same phrase more than twice in a row. "
-            "Return only the transcription text, no commentary.",
-            file_uri,
-            label="Transcribing",
-            duration_secs=duration,
-        )
+        transcript = "\n\n".join(transcript_parts)
+
+        # Sanity-check: for long audio a very short transcript likely means hallucination.
+        if duration and len(transcript.split()) < duration / 60 * 50:
+            expected_words = int(duration / 60 * 100)
+            print(
+                f"\n⚠ WARNING: transcript looks too short ({len(transcript.split())} words for "
+                f"{int(duration/60)}m audio; expected ~{expected_words}+). "
+                "Gemini may have hallucinated instead of transcribing.\n"
+            )
 
         summary = generate(
-            "Summarize the following transcript concisely. "
-            "Use Markdown formatting with headings and bullet lists. "
-            "Cover main topics, key points, and action items. "
-            "Write the summary in Russian.\n\n"
-            f"Transcript:\n{transcript}",
-            file_uri,
+            "Ты пишешь структурированный конспект групповой встречи — не эссе, а рабочие заметки.\n\n"
+            "СТРУКТУРА:\n"
+            "1. Заголовок: `# Конспект встречи: <тема>`\n"
+            "2. Раздел `## Формат и контекст` — 3–5 строк: что за встреча, какие главы/тема, характер дискуссии. Без литературных описаний атмосферы.\n"
+            "3. Пронумерованные разделы `## N. Заголовок темы` — по одному на каждую обсуждавшуюся тему.\n"
+            "4. В конце два списка: `## Что принято с энтузиазмом` и `## Что было оспорено или отвергнуто`.\n\n"
+            "СТИЛЬ ВНУТРИ РАЗДЕЛОВ:\n"
+            "- Одно-два вводных предложения: в чём суть темы.\n"
+            "- Если звучали разные мнения — раздел `Мнения:` со списком через `-`.\n"
+            "- Если было согласие или вывод — `Итог дискуссии:` одной строкой.\n"
+            "- Если были реакции (смех, удивление, споры) — `Реакция:` одной строкой.\n"
+            "- Если приводились примеры или параллели — `Параллели:` или `Примеры:` со списком через `-`.\n"
+            "- Ключевые термины, имена, концепции — **жирным**.\n"
+            "- Когда что-то принято или отвергнуто — пометь в скобках: (принято с энтузиазмом), (отвергнуто), (принято частично).\n\n"
+            "ТРЕБОВАНИЯ:\n"
+            "- Никаких литературных описаний обстановки, атмосферы, «в комнате повисла тишина» и т.п.\n"
+            "- Никаких прямых цитат в формате `>` — только если цитата очень точная, включай её в текст в кавычках.\n"
+            "- Пиши лаконично: одна мысль — одна строка или один пункт списка.\n"
+            "- Используй `-` для списков, `**жирный**` для ключевых слов, `---` между разделами.\n"
+            "- Язык — русский.\n"
+            "- Не добавляй транскрипт в конец.\n\n"
+            f"Транскрипт:\n{transcript}",
             label="Summarizing",
         )
     finally:
-        delete_file(file_name)
+        for chunk_path in chunks:
+            chunk_path.unlink(missing_ok=True)
+        if chunks:
+            try:
+                chunks[0].parent.rmdir()
+            except OSError:
+                pass
 
     t_path, s_path = save_outputs(stem, transcript, summary)
 
