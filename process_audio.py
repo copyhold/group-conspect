@@ -256,7 +256,7 @@ def save_outputs(stem: str, transcript: str, summary: str) -> tuple[Path, Path]:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     t_path = DOWNLOADS_DIR / f"{stem}_{ts}_transcript.txt"
-    s_path = DOWNLOADS_DIR / f"{stem}_{ts}_summary.txt"
+    s_path = DOWNLOADS_DIR / f"{stem}_{ts}_summary.md"
 
     t_path.write_text(transcript, encoding="utf-8")
     s_path.write_text(summary, encoding="utf-8")
