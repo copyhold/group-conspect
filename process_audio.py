@@ -14,6 +14,21 @@ from datetime import datetime
 import requests
 
 
+def _load_dotenv(path: Path = Path(".env")) -> None:
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+_load_dotenv()
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 MODEL = "gemini-3.5-flash"
@@ -27,6 +42,11 @@ DOWNLOADS_DIR = Path(os.environ.get(
     str(_android_downloads) if _android_downloads.parent.exists() else str(Path.home() / "Downloads"),
 ))
 TEMP_DIR = Path(os.environ.get("TMPDIR", "/data/data/com.termux/files/home/tmp"))
+
+NEXTCLOUD_HOST = os.environ.get("NEXTCLOUD_HOST", "")
+NEXTCLOUD_USER = os.environ.get("NEXTCLOUD_USER", "")
+NEXTCLOUD_PASS = os.environ.get("NEXTCLOUD_PASS", "")
+NEXTCLOUD_FOLDER = os.environ.get("NEXTCLOUD_FOLDER", "")
 
 
 def resolve_input(arg: str) -> Path:
@@ -263,6 +283,38 @@ def save_outputs(stem: str, transcript: str, summary: str) -> tuple[Path, Path]:
     return t_path, s_path
 
 
+def upload_to_nextcloud(paths: list[Path]) -> None:
+    """Upload files to the Nextcloud folder via WebDAV."""
+    if not (NEXTCLOUD_HOST and NEXTCLOUD_USER and NEXTCLOUD_PASS):
+        print("⚠ Nextcloud upload skipped: set NEXTCLOUD_HOST, NEXTCLOUD_USER, NEXTCLOUD_PASS (and optionally NEXTCLOUD_FOLDER)")
+        return
+
+    host = NEXTCLOUD_HOST.rstrip("/")
+    if not host.startswith("http"):
+        host = f"https://{host}"
+    auth = (NEXTCLOUD_USER, NEXTCLOUD_PASS)
+    base = f"{host}/remote.php/dav/files/{NEXTCLOUD_USER}"
+
+    # Create the target folder (and parents) if it doesn't exist.
+    folder = NEXTCLOUD_FOLDER.strip("/")
+    if folder:
+        partial = ""
+        for segment in folder.split("/"):
+            partial = f"{partial}/{segment}"
+            resp = requests.request("MKCOL", f"{base}{requests.utils.quote(partial)}", auth=auth, timeout=30)
+            if resp.status_code not in (201, 405):  # 405 = already exists
+                raise RuntimeError(f"Nextcloud MKCOL {partial} failed: {resp.status_code} {resp.text}")
+
+    prefix = f"/{folder}" if folder else ""
+    for path in paths:
+        url = f"{base}{requests.utils.quote(prefix)}/{requests.utils.quote(path.name)}"
+        print(f"Uploading {path.name} to Nextcloud...")
+        resp = requests.put(url, data=path.read_bytes(), auth=auth, timeout=120)
+        if resp.status_code not in (201, 204):
+            raise RuntimeError(f"Nextcloud upload of {path.name} failed: {resp.status_code} {resp.text}")
+    print(f"  ✓ Uploaded {len(paths)} file(s) to Nextcloud:{prefix or '/'}")
+
+
 def main():
     if not GEMINI_API_KEY:
         sys.exit(
@@ -339,6 +391,7 @@ def main():
                 pass
 
     t_path, s_path = save_outputs(stem, transcript, summary)
+    upload_to_nextcloud([t_path, s_path])
 
     if mp3_path != input_path and mp3_path.exists():
         mp3_path.unlink()
@@ -360,11 +413,11 @@ def summarize(transcript: str) -> str:
             "4. Пронумерованные разделы `## N. Заголовок темы` — по одному на каждую обсуждавшуюся тему.\n"
             "5. Два списка: `## Что принято с энтузиазмом` и `## Что было оспорено или отвергнуто`.\n"
             "6. Раздел `## Открытые вопросы` — что обсудили, но не довели до вывода; пригодится как затравка для следующей встречи. Если таких нет — пропусти раздел.\n"
-            "7. Раздел `## Упомянутые источники` — книги, статьи, фильмы, авторы, упомянутые на встрече, с одной строкой контекста: кто и в связи с чем упомянул. Если ничего не упоминали — пропусти раздел.\n"
+            "7. Раздел `## Упомянутые источники` — стихи из Библии, книги, статьи, фильмы, авторы, упомянутые на встрече, с одной строкой контекста: кто и в связи с чем упомянул. Если ничего не упоминали — пропусти раздел.\n"
             "8. Раздел `## Фактчек` — фактические утверждения, прозвучавшие на встрече, которые стоит проверить (даты, цифры, «учёные доказали» и т.п.). Помечай явно сомнительные. Если таких нет — пропусти раздел.\n"
             "9. В самом конце раздел `## Лучшие цитаты` — 3–5 самых ярких, смешных или метких формулировок участников дословно, в кавычках, с указанием участника. Это «забавные факты» встречи.\n\n"
             "СТИЛЬ ВНУТРИ РАЗДЕЛОВ:\n"
-            "- Одно-два вводных предложения: в чём суть темы.\n"
+            "- Три-пять вводных предложения: в чём суть темы.\n"
             "- Если звучали разные мнения — раздел `Мнения:` со списком через `-`.\n"
             "- Если было согласие или вывод — `Итог дискуссии:` одной строкой.\n"
             "- Если были реакции (смех, удивление, споры) — `Реакция:` одной строкой.\n"

@@ -1,0 +1,48 @@
+:root {
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --bg-secondary: var(--tg-theme-secondary-bg-color, #f0f0f0);
+  --text: var(--tg-theme-text-color, #000000);
+  --hint: var(--tg-theme-hint-color, #888888);
+  --link: var(--tg-theme-link-color, #2678b6);
+  --button: var(--tg-theme-button-color, #2678b6);
+  --button-text: var(--tg-theme-button-text-color, #ffffff);
+  --accent: var(--tg-theme-accent-text-color, #2678b6);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+a { color: var(--link); text-decoration: none; }
+
+button {
+  background: var(--button);
+  color: var(--button-text);
+  border: none;
+  border-radius: 8px;
+  padding: 10px 18px;
+  font-size: 15px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+button:disabled { opacity: 0.5; cursor: default; }
+
+input {
+  background: var(--bg-secondary);
+  color: var(--text);
+  border: none;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 15px;
+  width: 100%;
+  outline: none;
+}
+
+input::placeholder { color: var(--hint); }

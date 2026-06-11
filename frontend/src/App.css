@@ -1,0 +1,15 @@
+.markdown h1 { font-size: 1.3em; margin: 16px 0 8px; }
+.markdown h2 { font-size: 1.1em; margin: 14px 0 6px; color: var(--accent); }
+.markdown h3 { font-size: 1em; margin: 12px 0 4px; }
+.markdown p  { margin: 6px 0; }
+.markdown ul, .markdown ol { padding-left: 20px; margin: 6px 0; }
+.markdown li { margin: 3px 0; }
+.markdown hr { border: none; border-top: 1px solid var(--bg-secondary); margin: 16px 0; }
+.markdown strong { color: var(--text); }
+.markdown blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 12px;
+  color: var(--hint);
+  margin: 8px 0;
+}
+.markdown b { background: var(--button); color: var(--button-text); padding: 0 3px; border-radius: 3px; font-weight: normal; }

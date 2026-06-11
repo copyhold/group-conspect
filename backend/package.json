@@ -1,0 +1,20 @@
+{
+  "name": "group-conspect-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --env-file=.env --watch src/index.ts",
+    "start": "bun --env-file=.env src/index.ts",
+    "index": "bun --env-file=.env src/indexer.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^1.0.0",
+    "@xenova/transformers": "^2.17.2",
+    "ai": "^4.0.0",
+    "grammy": "^1.30.0",
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "bun-types": "latest"
+  }
+}
