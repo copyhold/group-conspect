@@ -4,7 +4,8 @@ COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend/ ./
 ARG VITE_BASE_URL=/conspect-bot/
-RUN VITE_BASE_URL=${VITE_BASE_URL} npx vite build --base=${VITE_BASE_URL}
+ARG VITE_API_URL=/conspect-bot/api
+RUN VITE_BASE_URL=${VITE_BASE_URL} VITE_API_URL=${VITE_API_URL} npx vite build --base=${VITE_BASE_URL}
 
 FROM oven/bun:1
 WORKDIR /app
