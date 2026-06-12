@@ -9,8 +9,8 @@ RUN VITE_BASE_URL=${VITE_BASE_URL} VITE_API_URL=${VITE_API_URL} npx vite build -
 
 FROM oven/bun:1
 WORKDIR /app
-COPY backend/package.json backend/bun.lock ./
-RUN bun install --frozen-lockfile
+COPY backend/package.json ./
+RUN bun install
 COPY backend/src/ ./src/
 COPY backend/tsconfig.json ./
 COPY --from=frontend-builder /frontend/dist ./dist
